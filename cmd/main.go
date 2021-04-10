@@ -15,15 +15,21 @@ import (
 
 const topic_name = "eth_block_processing/1"
 
-type PrintMessageProcessor struct{}
+type PrintMessageProcessor struct {
+	peerID core.PeerID
+}
 
 func (p *PrintMessageProcessor) ProcessReceivedMessage(message p2p.MessageP2P, fromConnectedPeer core.PeerID) error {
-	fmt.Printf("Received %v from %v\n", message, fromConnectedPeer)
+	if fromConnectedPeer == p.peerID {
+		return nil
+	}
+
+	fmt.Printf("Received %q from %v\n", string(message.Data()), fromConnectedPeer.Pretty())
 	return nil
 }
 
 func (p *PrintMessageProcessor) IsInterfaceNil() bool {
-	return p != nil
+	return p == nil
 }
 
 func main() {
@@ -89,7 +95,7 @@ func main() {
 		}
 	}
 
-	err = messenger.RegisterMessageProcessor(topic_name, &PrintMessageProcessor{})
+	err = messenger.RegisterMessageProcessor(topic_name, &PrintMessageProcessor{peerID: messenger.ID()})
 	if err != nil {
 		panic(err)
 	}
@@ -105,7 +111,6 @@ func mainLoop(messenger p2p.Messenger, stop chan os.Signal) {
 			return
 		case <-time.After(5 * time.Second):
 			fmt.Println(messenger.ConnectedAddresses())
-		case <-time.After(1 * time.Second):
 			messenger.Broadcast(topic_name, []byte(fmt.Sprintf("Hello from %v.", messenger.ID())))
 		}
 	}
