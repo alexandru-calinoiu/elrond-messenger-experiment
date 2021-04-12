@@ -13,47 +13,53 @@ import (
 const (
 	ActionsTopicName = "actions/1"
 	JoinedAction     = "joined"
-	ElectionAction   = "election"
 
-	PrivateTopicName = "private/1"
+	StateTopicName = "private/1"
+
+	Timeout = int64(30)
 )
 
-type PeerTimestamp struct {
-	PeerID    core.PeerID
-	Timestamp int64
-}
-type PeerJoinedTimestamps []PeerTimestamp
-
-type PrivateData struct {
-	Peers       PeerJoinedTimestamps
-	LeaderIndex uint
-}
+type Peers []core.PeerID
 
 type Relay struct {
-	peers       PeerJoinedTimestamps
-	messenger   NetMessenger
-	leaderIndex uint
+	peers        Peers
+	messenger    NetMessenger
+	timeProvider TimeProvider
 }
 
 type NetMessenger interface {
 	ID() core.PeerID
+	Addresses() []string
 	RegisterMessageProcessor(string, p2p.MessageProcessor) error
 	HasTopic(name string) bool
 	CreateTopic(name string, createChannelForTopic bool) error
-	Addresses() []string
 	Broadcast(topic string, buff []byte)
 	SendToConnectedPeer(topic string, buff []byte, peerID core.PeerID) error
 	Close() error
 }
 
-func NewRelay(messenger NetMessenger) (*Relay, error) {
-	self := &Relay{
-		peers:       make(PeerJoinedTimestamps, 0),
-		messenger:   messenger,
-		leaderIndex: 0,
+type TimeProvider interface {
+	UnixNow() int64
+}
+
+type defaultTimeProvider struct{}
+
+func (p *defaultTimeProvider) UnixNow() int64 {
+	return time.Now().Unix()
+}
+
+func NewRelay(messenger NetMessenger, timeProvider TimeProvider) (*Relay, error) {
+	if timeProvider == nil {
+		timeProvider = &defaultTimeProvider{}
 	}
 
-	topics := []string{ActionsTopicName, PrivateTopicName}
+	self := &Relay{
+		peers:        make(Peers, 0),
+		messenger:    messenger,
+		timeProvider: timeProvider,
+	}
+
+	topics := []string{ActionsTopicName, StateTopicName}
 	for _, topic := range topics {
 		if !messenger.HasTopic(topic) {
 			err := messenger.CreateTopic(topic, true)
@@ -80,16 +86,14 @@ func (r *Relay) ProcessReceivedMessage(message p2p.MessageP2P, _ core.PeerID) er
 		fmt.Printf("Action: %q\n", string(message.Data()))
 		switch string(message.Data()) {
 		case JoinedAction:
-			r.addPeer(message.Peer(), message.Timestamp())
-			err := r.broadcastPrivate(message.Peer())
+			r.addPeer(message.Peer())
+			err := r.broadcastState(message.Peer())
 			if err != nil {
 				fmt.Println(err)
 			}
-		case ElectionAction:
-			r.election(message.Peer())
 		}
-	case PrivateTopicName:
-		err := r.processPrivate(message.Data())
+	case StateTopicName:
+		err := r.parseState(message.Data())
 		if err != nil {
 			// TODO: log error
 			fmt.Println(err)
@@ -104,70 +108,55 @@ func (r *Relay) IsInterfaceNil() bool {
 }
 
 func (r *Relay) Join() {
-	time.Sleep(5 * time.Second)
+	time.Sleep(10 * time.Second)
 	fmt.Println(r.messenger.Addresses())
 
 	rand.Seed(time.Now().UnixNano())
 	v := rand.Intn(5)
 	time.Sleep(time.Duration(v) * time.Second)
 	r.messenger.Broadcast(ActionsTopicName, []byte(JoinedAction))
-}
 
-func (r *Relay) CallElection() {
-	if r.IAmLeader() {
-		r.messenger.Broadcast(ActionsTopicName, []byte(ElectionAction))
-	}
-}
-
-func (r *Relay) IAmLeader() bool {
-	return r.messenger.ID() == r.leader()
+	// start the loop
+	/*
+		- process block
+		- do we have deposit transactions?
+		- are they actionable? (have they been bridged)
+			- no: nothing to do
+			- yes: am I the leader?
+				- no: wait for 4 seconds for a signature request (on timeout try the next leader)
+				- yes: (monitor) propose && ask for signature (txhash
+			- monitor for execution confirmation the received txhash from leader
+	*/
 }
 
 func (r *Relay) Close() error {
 	return r.messenger.Close()
 }
 
-func (r *Relay) election(source core.PeerID) {
-	if len(r.peers) == 0 {
-		return
-	}
-
-	if source != r.leader() {
-		// don't know this leader
-		return
-	}
-
-	// TODO: need to ignore election calls from others that the leader
-	if r.leaderIndex+1 >= uint(len(r.peers)) {
-		r.leaderIndex = 0
-	} else {
-		r.leaderIndex++
-	}
-
-	fmt.Printf("The newly appointed leader is %q\n", r.leader().Pretty())
+func (r *Relay) amITheLeader() bool {
+	return r.messenger.ID() == r.leader()
 }
 
-func (r *Relay) addPeer(peerID core.PeerID, timestamp int64) {
+func (r *Relay) addPeer(peerID core.PeerID) {
 	// TODO: account for peers that rejoin
-	peerToBeAdded := PeerTimestamp{PeerID: peerID, Timestamp: timestamp}
-
-	if len(r.peers) == 0 || r.peers[len(r.peers)-1].Timestamp < timestamp {
-		r.peers = append(r.peers, peerToBeAdded)
+	if len(r.peers) == 0 || r.peers[len(r.peers)-1] < peerID {
+		r.peers = append(r.peers, peerID)
 		return
 	}
 
 	// TODO: can optimize via binary search
 	for index, peer := range r.peers {
-		if peer.Timestamp > timestamp {
-			r.peers = append(r.peers, PeerTimestamp{})
+		if peer > peerID {
+			r.peers = append(r.peers, "")
 			copy(r.peers[index+1:], r.peers[index:])
-			r.peers[index] = peerToBeAdded
+			r.peers[index] = peerID
 			break
 		}
 	}
 }
 
-func (r *Relay) processPrivate(data []byte) error {
+func (r *Relay) parseState(data []byte) error {
+	// TODO: ignore if peers are already set
 	if len(r.peers) > 1 {
 		// ignore this call if we already have peers
 		// TODO: find a better way here
@@ -175,34 +164,29 @@ func (r *Relay) processPrivate(data []byte) error {
 	}
 
 	dec := gob.NewDecoder(bytes.NewReader(data))
-	var privateData PrivateData
-	err := dec.Decode(&privateData)
+	var topology Peers
+	err := dec.Decode(&topology)
 	if err != nil {
 		return err
 	}
-	r.peers = privateData.Peers
-	r.leaderIndex = privateData.LeaderIndex
+	r.peers = topology
 
 	return nil
 }
 
-func (r *Relay) broadcastPrivate(toPeer core.PeerID) error {
-	if len(r.peers) == 1 && r.peers[0].PeerID == r.messenger.ID() {
+func (r *Relay) broadcastState(toPeer core.PeerID) error {
+	if len(r.peers) == 1 && r.peers[0] == r.messenger.ID() {
 		return nil
 	}
 
-	// TODO: a little chatty if all peers send to the newly joined one
 	var data bytes.Buffer
 	enc := gob.NewEncoder(&data)
-	err := enc.Encode(PrivateData{
-		Peers:       r.peers,
-		LeaderIndex: r.leaderIndex,
-	})
+	err := enc.Encode(r.peers)
 	if err != nil {
 		return err
 	}
 
-	err = r.messenger.SendToConnectedPeer(PrivateTopicName, data.Bytes(), toPeer)
+	err = r.messenger.SendToConnectedPeer(StateTopicName, data.Bytes(), toPeer)
 	if err != nil {
 		return err
 	}
@@ -214,6 +198,10 @@ func (r *Relay) leader() core.PeerID {
 	if len(r.peers) == 0 {
 		return ""
 	} else {
-		return r.peers[r.leaderIndex].PeerID
+		unixTime := r.timeProvider.UnixNow()
+		numberOfPeers := uint64(len(r.peers))
+		index := uint64(unixTime/Timeout) % numberOfPeers
+
+		return r.peers[index]
 	}
 }

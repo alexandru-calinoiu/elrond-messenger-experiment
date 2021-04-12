@@ -54,10 +54,7 @@ func (p *messageProcessorRegistererStub) ID() core.PeerID {
 	return "myself"
 }
 
-func (p *messageProcessorRegistererStub) Broadcast(topicName string, data []byte) {
-	if topicName == ActionsTopicName && string(data) == ElectionAction {
-		p.electionWasCalled = true
-	}
+func (p *messageProcessorRegistererStub) Broadcast(string, []byte) {
 }
 
 func (p *messageProcessorRegistererStub) SendToConnectedPeer(topic string, buff []byte, peerID core.PeerID) error {
@@ -135,13 +132,19 @@ func (msg *P2PMessageMock) IsInterfaceNil() bool {
 	return msg == nil
 }
 
+type mockTimeProvider struct{ currentTime int64 }
+
+func (p *mockTimeProvider) UnixNow() int64 {
+	return p.currentTime
+}
+
 func TestConstructor(t *testing.T) {
-	topics := []string{ActionsTopicName, PrivateTopicName}
+	topics := []string{ActionsTopicName, StateTopicName}
 
 	for _, topic := range topics {
 		t.Run(fmt.Sprintf("will create %q if it does not exist", topic), func(t *testing.T) {
 			messenger := &messageProcessorRegistererStub{createdTopics: []string{}}
-			_, err := NewRelay(messenger)
+			_, err := NewRelay(messenger, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -155,21 +158,15 @@ func TestConstructor(t *testing.T) {
 
 func TestPrivateTopic(t *testing.T) {
 	messenger := &messageProcessorRegistererStub{}
-	relay, err := NewRelay(messenger)
+	relay, err := NewRelay(messenger, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	privateMessageProcessor := messenger.registeredMessageProcessors[PrivateTopicName]
+	privateMessageProcessor := messenger.registeredMessageProcessors[StateTopicName]
 	var data bytes.Buffer
 	enc := gob.NewEncoder(&data)
-	expected := PrivateData{
-		Peers: PeerJoinedTimestamps{
-			PeerTimestamp{"first", 1},
-			PeerTimestamp{"second", 2},
-		},
-		LeaderIndex: 1,
-	}
+	expected := Peers{"first", "second"}
 	err = enc.Encode(expected)
 	if err != nil {
 		t.Fatal(err)
@@ -178,34 +175,24 @@ func TestPrivateTopic(t *testing.T) {
 	message := buildPrivateMessage("other", data.Bytes())
 	_ = privateMessageProcessor.ProcessReceivedMessage(message, "peer_near_me")
 
-	if !reflect.DeepEqual(relay.peers, expected.Peers) {
-		t.Errorf("Expected peers to be %v, but there are %v", expected.Peers, relay.peers)
-	}
-
-	if relay.leaderIndex != expected.LeaderIndex {
-		t.Errorf("Expected leader index to be %d, but it was %d", expected.LeaderIndex, relay.leaderIndex)
+	if !reflect.DeepEqual(relay.peers, expected) {
+		t.Errorf("Expected peers to be %v, but there are %v", expected, relay.peers)
 	}
 }
 
 func TestJoinedAction(t *testing.T) {
 	t.Run("when there there more peers than yourself will broadcast to private", func(t *testing.T) {
 		messenger := &messageProcessorRegistererStub{}
-		_, err := NewRelay(messenger)
+		_, err := NewRelay(messenger, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		privateMessageProcessor := messenger.registeredMessageProcessors[PrivateTopicName]
+		privateMessageProcessor := messenger.registeredMessageProcessors[StateTopicName]
 		var data bytes.Buffer
 		enc := gob.NewEncoder(&data)
-		existingPeers := PeerJoinedTimestamps{
-			PeerTimestamp{"first", 1},
-			PeerTimestamp{"second", 2},
-		}
-		privateData := PrivateData{
-			Peers:       existingPeers,
-			LeaderIndex: 0,
-		}
+		existingPeers := Peers{"first", "second"}
+		privateData := existingPeers
 		err = enc.Encode(privateData)
 		if err != nil {
 			t.Fatal(err)
@@ -216,22 +203,23 @@ func TestJoinedAction(t *testing.T) {
 
 		actionsMessageProcessor := messenger.registeredMessageProcessors[ActionsTopicName]
 		_ = actionsMessageProcessor.ProcessReceivedMessage(buildJoinedMessage("other", 42), "peer_near_me")
-		expected := append(existingPeers, PeerTimestamp{"other", 42})
+
+		expected := Peers{"first", "other", "second"}
 
 		dec := gob.NewDecoder(bytes.NewReader(messenger.lastSendData))
-		var got PrivateData
+		var got Peers
 		err = dec.Decode(&got)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if !reflect.DeepEqual(expected, got.Peers) {
+		if !reflect.DeepEqual(expected, got) {
 			t.Errorf("Expected %v, got %v", expected, got)
 		}
 	})
 	t.Run("when you just joined will not broadcast to private", func(t *testing.T) {
 		messenger := &messageProcessorRegistererStub{}
-		_, err := NewRelay(messenger)
+		_, err := NewRelay(messenger, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -246,97 +234,31 @@ func TestJoinedAction(t *testing.T) {
 }
 
 func TestLeaderSelection(t *testing.T) {
-	cases := []struct {
-		description    string
-		messages       []p2p.MessageP2P
-		expectedLeader core.PeerID
-	}{
-		{
-			description:    "the first joined will be the leader after the first election",
-			messages:       []p2p.MessageP2P{buildJoinedMessage("second", 2), buildJoinedMessage("first", 1)},
-			expectedLeader: "first",
-		},
-		{
-			description: "will choose the next peer based on Timestamp on successive election",
-			messages: []p2p.MessageP2P{
-				buildJoinedMessage("second", 2),
-				buildJoinedMessage("first", 1),
-				buildElectionMessage(),
-			},
-			expectedLeader: "second",
-		},
-		{
-			description: "will choose the first peer again on successive election",
-			messages: []p2p.MessageP2P{
-				buildJoinedMessage("second", 2),
-				buildJoinedMessage("first", 1),
-				buildElectionMessage(),
-				buildElectionMessage(),
-			},
-			expectedLeader: "first",
-		},
-		{
-			description:    "will skip election if it has no peers",
-			messages:       []p2p.MessageP2P{buildElectionMessage()},
-			expectedLeader: "",
-		},
-	}
-
-	for _, tt := range cases {
-		t.Run(tt.description, func(t *testing.T) {
-			messenger := &messageProcessorRegistererStub{}
-			relay, err := NewRelay(messenger)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			actionsMessageProcessor := messenger.registeredMessageProcessors[ActionsTopicName]
-			for _, message := range tt.messages {
-				_ = actionsMessageProcessor.ProcessReceivedMessage(message, "peer_near_me")
-			}
-
-			if relay.leader() != tt.expectedLeader {
-				t.Errorf("Expect leader to be %v, but was %v", tt.expectedLeader, relay.leader())
-			}
-		})
-	}
-}
-
-func TestCallElection(t *testing.T) {
-	t.Run("it will broadcast on election topic if it is the current leader", func(t *testing.T) {
+	t.Run("will not select a leader if there are no peers", func(t *testing.T) {
 		messenger := &messageProcessorRegistererStub{}
-		relay, err := NewRelay(messenger)
+		relay, err := NewRelay(messenger, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		joinedMessageProcessor := messenger.registeredMessageProcessors[ActionsTopicName]
-		_ = joinedMessageProcessor.ProcessReceivedMessage(buildJoinedMessage(messenger.ID(), 0), "peer_near_me")
-		electionMessageProcessor := messenger.registeredMessageProcessors[PrivateTopicName]
-		_ = electionMessageProcessor.ProcessReceivedMessage(buildElectionMessage(), "peer_near_me")
-
-		relay.CallElection()
-
-		if !messenger.electionWasCalled {
-			t.Error("Expected a message to be broadcasted on the election topic")
+		if relay.leader() != "" {
+			t.Error("Expected no leader")
 		}
 	})
-	t.Run("it will not broadcast on the election topic if it's not the leader", func(t *testing.T) {
+	t.Run("will select leader based on time", func(t *testing.T) {
 		messenger := &messageProcessorRegistererStub{}
-		relay, err := NewRelay(messenger)
+		relay, err := NewRelay(messenger, &mockTimeProvider{120})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		joinedMessageProcessor := messenger.registeredMessageProcessors[ActionsTopicName]
-		_ = joinedMessageProcessor.ProcessReceivedMessage(buildJoinedMessage("other", 0), "peer_near_me")
-		electionMessageProcessor := messenger.registeredMessageProcessors[PrivateTopicName]
-		_ = electionMessageProcessor.ProcessReceivedMessage(buildElectionMessage(), "peer_near_me")
+		actionsMessageProcessor := messenger.registeredMessageProcessors[ActionsTopicName]
+		expected := core.PeerID("first")
+		_ = actionsMessageProcessor.ProcessReceivedMessage(buildJoinedMessage("second", 2), "peer_near_me")
+		_ = actionsMessageProcessor.ProcessReceivedMessage(buildJoinedMessage(expected, 1), "peer_near_me")
 
-		relay.CallElection()
-
-		if messenger.electionWasCalled {
-			t.Error("Expected a message not to be broadcasted on the election topic")
+		if relay.leader() != expected {
+			t.Errorf("Expect leader to be %v, but was %v", expected, relay.leader())
 		}
 	})
 }
@@ -350,16 +272,9 @@ func buildJoinedMessage(peerID core.PeerID, timestamp int64) p2p.MessageP2P {
 	}
 }
 
-func buildElectionMessage() p2p.MessageP2P {
-	return &P2PMessageMock{
-		TopicField: ActionsTopicName,
-		DataField:  []byte(ElectionAction),
-	}
-}
-
 func buildPrivateMessage(peerID core.PeerID, data []byte) p2p.MessageP2P {
 	return &P2PMessageMock{
-		TopicField: PrivateTopicName,
+		TopicField: StateTopicName,
 		PeerField:  peerID,
 		DataField:  data,
 	}

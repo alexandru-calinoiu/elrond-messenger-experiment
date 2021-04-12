@@ -86,7 +86,7 @@ func mainLoop(relayNode *relay.Relay, stop chan os.Signal) {
 
 			return
 		case <-time.After(10 * time.Second):
-			relayNode.CallElection()
+			// why
 		}
 	}
 }
