@@ -65,7 +65,7 @@ func main() {
 		panic(err)
 	}
 
-	relayNode, err := relay.NewRelay(messenger)
+	relayNode, err := relay.NewRelay(messenger, nil)
 	if err != nil {
 		panic(err)
 	}
