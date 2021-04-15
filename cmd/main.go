@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"github.com/ElrondNetwork/elrond-go/config"
 	factoryMarshalizer "github.com/ElrondNetwork/elrond-go/marshal/factory"
 	"github.com/ElrondNetwork/elrond-go/p2p/libp2p"
@@ -65,12 +66,13 @@ func main() {
 		panic(err)
 	}
 
-	relayNode, err := relay.NewRelay(messenger, nil)
+	relayNode, err := relay.NewRelay(messenger, nil, nil, nil)
 	if err != nil {
 		panic(err)
 	}
 
-	go relayNode.Join()
+	ctx := context.Background()
+	err = relayNode.Join(ctx)
 
 	mainLoop(relayNode, sigs)
 }
