@@ -162,6 +162,24 @@ func TestJoin(t *testing.T) {
 			t.Error("Expected relay that is not a leader to wait for a proposal")
 		}
 	})
+	t.Run("will sign proposed transaction if not leader", func(t *testing.T) {
+		messenger := &messageProcessorRegistererStub{peerID: "first"}
+		expected := DepositTransaction{}
+		ethSafe := &safeStub{transactions: map[uint64]DepositTransactions{0: {expected}}}
+		elrondBridgeContract := &bridgeContractStub{wasProposed: true}
+		relay, _ := NewRelay(messenger, ethSafe, nil, elrondBridgeContract)
+		relay.timer = &timerStub{sleepDelay: 1 * time.Millisecond, now: int64(Timeout.Seconds()) + 1}
+
+		privateMessageProcessor := messenger.registeredMessageProcessors[PrivateTopicName]
+		_ = privateMessageProcessor.ProcessReceivedMessage(buildPrivateMessage("other", Peers{"first", "second"}), "peer_near_me")
+
+		cancel := join(relay, 10*time.Millisecond)
+		defer cancel()
+
+		if !reflect.DeepEqual(&expected, elrondBridgeContract.lastSignedTransaction) {
+			t.Error("Expected to sign the proposed transaction")
+		}
+	})
 	t.Run("will monitor for signatures if leader", func(t *testing.T) {
 		messenger := &messageProcessorRegistererStub{peerID: "first"}
 		ethSafe := &safeStub{transactions: map[uint64]DepositTransactions{0: {DepositTransaction{}}}}
@@ -198,6 +216,60 @@ func TestJoin(t *testing.T) {
 
 		if !reflect.DeepEqual(&expected, elrondBridgeContract.lastExecutedTransaction) {
 			t.Errorf("Expected execute to be called with %v, but was called with %v", expected, elrondBridgeContract.lastExecutedTransaction)
+		}
+	})
+	t.Run("will move to next transaction in block after execute when leader", func(t *testing.T) {
+		messenger := &messageProcessorRegistererStub{peerID: "first"}
+		expected := DepositTransaction{hash: "last"}
+		ethSafe := &safeStub{transactions: map[uint64]DepositTransactions{0: {DepositTransaction{hash: "first"}, expected}}}
+		elrondBridgeContract := &bridgeContractStub{signersCount: 3, lastExecutedTransaction: nil}
+		relay, _ := NewRelay(messenger, ethSafe, nil, elrondBridgeContract)
+		relay.timer = &timerStub{sleepDelay: 1 * time.Millisecond, now: int64(Timeout.Seconds() - 1)}
+
+		actionsMessageProcessor := messenger.registeredMessageProcessors[PrivateTopicName]
+		_ = actionsMessageProcessor.ProcessReceivedMessage(buildPrivateMessage("second", Peers{"first", "second", "other"}), "peer_near_me")
+
+		cancel := join(relay, 10*time.Millisecond)
+		defer cancel()
+
+		if !reflect.DeepEqual(&expected, elrondBridgeContract.lastExecutedTransaction) {
+			t.Errorf("Expected execute to be called with %v, but was called with %v", &expected, elrondBridgeContract.lastExecutedTransaction)
+		}
+	})
+	t.Run("will monitor for execution when not leader and number of signatures is reached", func(t *testing.T) {
+		messenger := &messageProcessorRegistererStub{peerID: "first"}
+		expect := DepositTransaction{}
+		ethSafe := &safeStub{transactions: map[uint64]DepositTransactions{0: {expect}}}
+		elrondBridgeContract := &bridgeContractStub{signersCount: 3, wasProposed: true}
+		relay, _ := NewRelay(messenger, ethSafe, nil, elrondBridgeContract)
+		relay.timer = &timerStub{sleepDelay: 1 * time.Millisecond, now: int64(Timeout.Seconds() + 1)}
+
+		actionsMessageProcessor := messenger.registeredMessageProcessors[PrivateTopicName]
+		_ = actionsMessageProcessor.ProcessReceivedMessage(buildPrivateMessage("second", Peers{"first", "second", "other"}), "peer_near_me")
+
+		cancel := join(relay, 10*time.Millisecond)
+		defer cancel()
+
+		if !reflect.DeepEqual(&expect, elrondBridgeContract.lastTransactionCheckedForExecute) {
+			t.Error("Expected relay that is not leader to wait for execution")
+		}
+	})
+	t.Run("will move to the next transaction in block after execution confirmed and not leader", func(t *testing.T) {
+		messenger := &messageProcessorRegistererStub{peerID: "first"}
+		expect := DepositTransaction{hash: "last"}
+		ethSafe := &safeStub{transactions: map[uint64]DepositTransactions{0: {DepositTransaction{hash: "first"}, expect}}}
+		elrondBridgeContract := &bridgeContractStub{signersCount: 3, wasProposed: true, wasExecuted: true}
+		relay, _ := NewRelay(messenger, ethSafe, nil, elrondBridgeContract)
+		relay.timer = &timerStub{sleepDelay: 1 * time.Millisecond, now: int64(Timeout.Seconds() + 1)}
+
+		actionsMessageProcessor := messenger.registeredMessageProcessors[PrivateTopicName]
+		_ = actionsMessageProcessor.ProcessReceivedMessage(buildPrivateMessage("second", Peers{"first", "second", "other"}), "peer_near_me")
+
+		cancel := join(relay, 10*time.Millisecond)
+		defer cancel()
+
+		if !reflect.DeepEqual(&expect, elrondBridgeContract.lastTransactionCheckedForExecute) {
+			t.Errorf("Expected last transaction checked for execution to be %v, but was %v", &expect, elrondBridgeContract.lastTransactionCheckedForExecute)
 		}
 	})
 	t.Run("will not get the next block while deposit transactions need processing", func(t *testing.T) {
@@ -250,7 +322,10 @@ type bridgeContractStub struct {
 	signCountCall                     uint
 	lastExecutedTransaction           *DepositTransaction
 	lastTransactionCheckedForProposal *DepositTransaction
-	wasProposalMade                   bool
+	wasProposed                       bool
+	lastTransactionCheckedForExecute  *DepositTransaction
+	wasExecuted                       bool
+	lastSignedTransaction             *DepositTransaction
 	signersCalledCount                uint
 	signersCount                      uint
 }
@@ -262,12 +337,18 @@ func (c *bridgeContractStub) Propose(transaction *DepositTransaction) {
 	c.proposedTransactions = append(c.proposedTransactions, *transaction)
 }
 
-func (c *bridgeContractStub) WasProposalMadeFor(t *DepositTransaction) bool {
+func (c *bridgeContractStub) WasProposed(t *DepositTransaction) bool {
 	c.lastTransactionCheckedForProposal = t
-	return c.wasProposalMade
+	return c.wasProposed
 }
 
-func (c *bridgeContractStub) Sign(*DepositTransaction) {
+func (c *bridgeContractStub) WasExecuted(t *DepositTransaction) bool {
+	c.lastTransactionCheckedForExecute = t
+	return c.wasExecuted
+}
+
+func (c *bridgeContractStub) Sign(t *DepositTransaction) {
+	c.lastSignedTransaction = t
 	c.signCountCall++
 }
 

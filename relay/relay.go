@@ -33,6 +33,8 @@ const (
 	Propose           State = 3
 	WaitForSignatures State = 4
 	Execute           State = 5
+	WaitForProposal   State = 6
+	WaitForExecute    State = 7
 )
 
 type Relay struct {
@@ -44,10 +46,8 @@ type Relay struct {
 	elrondSafe           Safe
 	elrondBridgeContract BridgeContract
 
-	ethBlockIndex        uint64
-	depositTransactions  DepositTransactions
-	proposedTransaction  *DepositTransaction
-	executingTransaction *DepositTransaction
+	ethBlockIndex       uint64
+	depositTransactions DepositTransactions
 
 	initialState State
 	currentState State
@@ -74,13 +74,16 @@ type Safe interface {
 
 type BridgeContract interface {
 	Propose(*DepositTransaction)
-	WasProposalMadeFor(*DepositTransaction) bool
+	WasProposed(*DepositTransaction) bool
+	WasExecuted(*DepositTransaction) bool
 	Sign(*DepositTransaction)
 	Execute(*DepositTransaction)
 	SignersCount(*DepositTransaction) uint
 }
 
-type DepositTransaction struct{}
+type DepositTransaction struct {
+	hash string
+}
 
 type DepositTransactions []DepositTransaction
 
@@ -176,6 +179,10 @@ func (r *Relay) Join(ctx context.Context) error {
 				go r.waitForSignatures(ch)
 			case Execute:
 				go r.execute(ch)
+			case WaitForProposal:
+				go r.waitForProposal(ch)
+			case WaitForExecute:
+				go r.waitForExecute(ch)
 			}
 		case <-ctx.Done():
 			return r.Close()
@@ -268,35 +275,35 @@ func (r *Relay) readBlock(ch chan State) {
 	if len(r.depositTransactions) > 0 {
 		ch <- Propose
 	} else {
-		r.ethBlockIndex++
-		ch <- ReadBlock
+		r.moveToNexBlock(ch)
 	}
 }
 
 func (r *Relay) propose(ch chan State) {
 	if r.amITheLeader() {
-		r.proposedTransaction = &r.depositTransactions[0]
-		r.elrondBridgeContract.Propose(r.proposedTransaction)
-		r.depositTransactions = r.depositTransactions[1:]
+		r.elrondBridgeContract.Propose(&r.depositTransactions[0])
 		ch <- WaitForSignatures
 	} else {
-		r.timer.sleep(Timeout)
-		if r.elrondBridgeContract.WasProposalMadeFor(&r.depositTransactions[0]) {
-			// sign
-		} else {
-			ch <- Propose
-		}
+		ch <- WaitForProposal
+	}
+}
+
+func (r *Relay) waitForProposal(ch chan State) {
+	r.timer.sleep(Timeout)
+	if r.elrondBridgeContract.WasProposed(&r.depositTransactions[0]) {
+		r.elrondBridgeContract.Sign(&r.depositTransactions[0])
+		ch <- Execute
+	} else {
+		ch <- Propose
 	}
 }
 
 func (r *Relay) waitForSignatures(ch chan State) {
-	r.timer.sleep(1 * time.Second)
-	count := r.elrondBridgeContract.SignersCount(r.proposedTransaction)
+	r.timer.sleep(Timeout)
+	count := r.elrondBridgeContract.SignersCount(&r.depositTransactions[0])
 	minCountRequired := math.Ceil(float64(len(r.peers)) * MinSignaturePercent / 100)
 
 	if count >= uint(minCountRequired) && count > 0 {
-		r.executingTransaction = r.proposedTransaction
-		r.proposedTransaction = nil
 		ch <- Execute
 	} else {
 		ch <- WaitForSignatures
@@ -304,10 +311,21 @@ func (r *Relay) waitForSignatures(ch chan State) {
 }
 
 func (r *Relay) execute(ch chan State) {
-	r.elrondBridgeContract.Execute(r.executingTransaction)
-	r.executingTransaction = nil
-	r.ethBlockIndex++
-	ch <- ReadBlock
+	if r.amITheLeader() {
+		r.elrondBridgeContract.Execute(&r.depositTransactions[0])
+		r.finishExecution(ch)
+	} else {
+		ch <- WaitForExecute
+	}
+}
+
+func (r *Relay) waitForExecute(ch chan State) {
+	r.timer.sleep(Timeout)
+	if r.elrondBridgeContract.WasExecuted(&r.depositTransactions[0]) {
+		r.finishExecution(ch)
+	} else {
+		ch <- Execute
+	}
 }
 
 // Helpers
@@ -320,5 +338,20 @@ func (r *Relay) amITheLeader() bool {
 		index := (r.timer.nowUnix() / int64(Timeout.Seconds())) % numberOfPeers
 
 		return r.peers[index] == r.messenger.ID()
+	}
+}
+
+func (r *Relay) moveToNexBlock(ch chan State) {
+	r.ethBlockIndex++
+	ch <- ReadBlock
+}
+
+func (r *Relay) finishExecution(ch chan State) {
+	r.depositTransactions = r.depositTransactions[1:]
+
+	if len(r.depositTransactions) == 0 {
+		r.moveToNexBlock(ch)
+	} else {
+		ch <- Propose
 	}
 }
